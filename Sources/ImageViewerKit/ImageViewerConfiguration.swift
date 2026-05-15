@@ -77,6 +77,12 @@ public struct ImageViewerConfiguration {
         .openImageIO    // Catch-all: 100+ formats
     ]
 
+    // MARK: - Init
+
+    /// Explicitly public so callers outside the module can instantiate it.
+    /// (Swift defaults struct inits to `internal` even when the type is `public`.)
+    public init() {}
+
     // MARK: - Presets
 
     /// Default configuration — HDR on, all UI visible, sensible zoom limits.
