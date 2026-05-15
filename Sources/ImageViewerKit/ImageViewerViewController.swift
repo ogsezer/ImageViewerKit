@@ -234,11 +234,12 @@ public final class ImageViewerViewController: NSViewController {
                 let result = try await decoderPipeline.decode(url: url)
                 await MainActor.run {
                     self.showLoading(false)
-                    // Prefer the HDR-preserving CIImage path when the decoder
-                    // produced one. The NSImage extraction clips to SDR.
-                    if let ci = result.ciImage {
+                    // v1.2.4: pass both SDR base and HDR variants — renderer picks
+                    // per-frame based on display mode. No tone-mapping hack.
+                    if result.sdrCIImage != nil || result.hdrCIImage != nil {
                         self.hdrRenderer.display(
-                            ciImage: ci,
+                            sdr: result.sdrCIImage,
+                            hdr: result.hdrCIImage,
                             headroom: result.metadata.headroom,
                             configuration: self.configuration
                         )

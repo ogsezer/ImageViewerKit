@@ -1,19 +1,20 @@
 // HDRRenderer.swift
 // ImageViewerKit
 //
-// Metal-backed image canvas with Apple EDR (Extended Dynamic Range) support.
-// Renders true HDR on Pro Display XDR, MacBook Pro 14/16, iPhone 15 Pro.
-// Falls back gracefully to SDR Core Image rendering on other screens.
+// Metal-backed image canvas with Apple EDR support.
 //
-// Display mode is RUNTIME-MUTABLE: setting `displayMode` reconfigures the
-// CAMetalLayer (EDR flag, colorspace) and CIContext (working/output space)
-// in place, then triggers a re-render.
+// Display strategy (v1.2.4):
+//   The renderer holds TWO CIImages from the decoder:
+//     • sdrCIImage — SDR base, no gain map applied (values in [0…1])
+//     • hdrCIImage — gain map applied via CIImage.expandToHDR (values may be >1.0)
 //
-// Compare mode (v1.2.0):
-//   Set `compareSplit` to a value in 0…1 to render the LEFT half tone-mapped
-//   to SDR and the RIGHT half in HDR (with a thin white divider). Set to nil
-//   to disable. The PixelDrop app drives this from cursor X position when the
-//   user presses 'C'.
+//   Each render() picks the right one based on `effectiveHDR()`. No tone-curve
+//   hack, no re-decode on toggle. The Metal layer + CIContext are reconfigured
+//   in place when the display mode changes.
+//
+// Compare mode:
+//   `compareSplit ∈ 0…1` renders SDR on the left, HDR on the right with a
+//   thin white divider — perfect for visualising the gain map's effect.
 
 import AppKit
 import Metal
@@ -34,7 +35,10 @@ public final class HDRRenderer: NSView {
 
     // MARK: - Image State
 
-    private var currentCIImage: CIImage?
+    /// SDR base image — preferred for SDR display. Values ∈ [0…1].
+    private var sdrCIImage: CIImage?
+    /// HDR rendition — gain map applied. Values may be >1.0.
+    private var hdrCIImage: CIImage?
 
     /// HDR headroom of the currently-displayed image (1.0 = SDR, >1.0 = HDR).
     public private(set) var currentImageHeadroom: Float = 1.0
@@ -58,7 +62,7 @@ public final class HDRRenderer: NSView {
     }
 
     /// Side-by-side compare. nil = disabled. 0…1 = horizontal split position.
-    /// Left half = SDR (tone-mapped), right half = HDR.
+    /// Left half = SDR base, right half = HDR.
     public var compareSplit: CGFloat? {
         didSet {
             guard oldValue != compareSplit else { return }
@@ -139,57 +143,76 @@ public final class HDRRenderer: NSView {
         self.ciContext = CIContext(mtlDevice: device, options: opts)
     }
 
-    // MARK: - Display
+    // MARK: - Display API
 
-    /// Display a CIImage directly — preferred path. The CIImage retains its
-    /// extended-range pixel data all the way to the Metal drawable, which
-    /// is essential for HDR rendering (NSImage extraction clips to SDR).
+    /// Primary display method — provide both variants. Renderer picks the
+    /// right one per frame based on display mode (SDR/HDR/Auto).
+    /// At least one of `sdr` or `hdr` must be non-nil.
+    public func display(sdr: CIImage?,
+                        hdr: CIImage?,
+                        headroom: Float = 1.0,
+                        configuration: ImageViewerConfiguration) {
+        sdrCIImage           = sdr
+        hdrCIImage           = hdr
+        currentImageHeadroom = max(1.0, headroom)
+        userZoom             = 1.0
+        userPan              = .zero
+        rotation             = 0
+        hasUserAdjustedZoom  = false
+        DispatchQueue.main.async { [weak self] in self?.render() }
+    }
+
+    /// Convenience: display a single CIImage as both SDR and HDR
+    /// (used when caller has only one variant — e.g. EXR, plain JPEG).
     public func display(ciImage: CIImage,
                         headroom: Float = 1.0,
                         configuration: ImageViewerConfiguration) {
-        currentCIImage         = ciImage
-        currentImageHeadroom   = max(1.0, headroom)
-        userZoom               = 1.0
-        userPan                = .zero
-        rotation               = 0
-        hasUserAdjustedZoom    = false
-        DispatchQueue.main.async { [weak self] in self?.render() }
+        display(sdr: ciImage, hdr: ciImage, headroom: headroom, configuration: configuration)
     }
 
-    /// Display an NSImage with optional HDR headroom info from the decoder.
-    /// ⚠️ This path goes through `NSImage.cgImage(forProposedRect:...)` which
-    /// clips extended-range values to SDR. Prefer `display(ciImage:headroom:)`
-    /// for actual HDR display.
+    /// ⚠️ Legacy NSImage path — clips extended values to SDR via AppKit's
+    /// `cgImage(forProposedRect:...)`. Prefer `display(sdr:hdr:)`.
     public func display(image: NSImage,
                         headroom: Float = 1.0,
                         configuration: ImageViewerConfiguration) {
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
-        currentCIImage         = CIImage(cgImage: cgImage)
-        currentImageHeadroom   = max(1.0, headroom)
-        userZoom               = 1.0
-        userPan                = .zero
-        rotation               = 0
-        hasUserAdjustedZoom    = false
-        DispatchQueue.main.async { [weak self] in self?.render() }
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let ci = CIImage(cgImage: cg)
+        display(sdr: ci, hdr: ci, headroom: headroom, configuration: configuration)
     }
+
+    // MARK: - Image Selection
+
+    /// Pick the appropriate CIImage for the current rendering pass.
+    private func currentImage(useHDR: Bool) -> CIImage? {
+        if useHDR {
+            return hdrCIImage ?? sdrCIImage
+        } else {
+            return sdrCIImage ?? hdrCIImage
+        }
+    }
+
+    /// The image used for compare-mode probing of size etc.
+    private func anyImage() -> CIImage? { hdrCIImage ?? sdrCIImage }
 
     // MARK: - Rendering
 
     private func render() {
         guard
-            let ciImage    = currentCIImage,
             let metalLayer = metalLayer,
             metalLayer.drawableSize.width  > 0,
             metalLayer.drawableSize.height > 0,
             let drawable   = metalLayer.nextDrawable(),
             let cmdQueue   = commandQueue,
-            let ciContext  = ciContext
+            let ciContext  = ciContext,
+            let baseImage  = anyImage()
         else { return }
 
-        // 1. Compute transform (centred + scaled to fit + user zoom/pan)
+        let useHDR = effectiveHDR()
+
+        // 1. Compute the shared transform (centred + scaled to fit + user zoom/pan)
         let drawableSize = CGSize(width:  drawable.texture.width,
                                   height: drawable.texture.height)
-        let imageSize    = ciImage.extent.size
+        let imageSize    = baseImage.extent.size
 
         let rotated     = abs(rotation.truncatingRemainder(dividingBy: 180)) > 0.001
         let imageBoundW = rotated ? imageSize.height : imageSize.width
@@ -203,33 +226,36 @@ public final class HDRRenderer: NSView {
             .rotated(by: self.rotation * .pi / 180)
             .translatedBy(x: -imageSize.width / 2, y: -imageSize.height / 2)
 
-        var positioned = ciImage.transformed(by: rotXfm)
-        positioned = positioned.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        // Helper that applies the full transform pipeline to any CIImage
+        // (so we can position SDR and HDR variants identically for compare mode).
+        func position(_ image: CIImage) -> CIImage {
+            var p = image.transformed(by: rotXfm)
+            p = p.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            let ext = p.extent
+            let tx = (drawableSize.width  - ext.width)  / 2 - ext.origin.x + userPan.x
+            let ty = (drawableSize.height - ext.height) / 2 - ext.origin.y + userPan.y
+            return p.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+        }
 
-        let extent = positioned.extent
-        let tx = (drawableSize.width  - extent.width)  / 2 - extent.origin.x + userPan.x
-        let ty = (drawableSize.height - extent.height) / 2 - extent.origin.y + userPan.y
-        positioned = positioned.transformed(by: CGAffineTransform(translationX: tx, y: ty))
-
-        // 2. Build the SDR and HDR variants we may need
-        let hdrVersion = positioned                                     // pixels keep headroom
-        let sdrVersion = applyToneMapping(to: positioned,               // tone-mapped to [0..1]
-                                          mode: configuration.toneMappingMode)
-
-        // 3. Choose final composite based on mode + compare split
+        // 2. Choose composite based on compare/single mode
         let drawableRect = CGRect(origin: .zero, size: drawableSize)
         let bg = CIImage(color: CIColor.black).cropped(to: drawableRect)
         var composited: CIImage
 
-        if let split = compareSplit, (0.0...1.0).contains(split) {
-            // Compare mode — left = SDR, right = HDR, divider in the middle
-            let splitX = drawableSize.width * split
-            let leftRect  = CGRect(x: 0,      y: 0, width: splitX,                    height: drawableSize.height)
-            let rightRect = CGRect(x: splitX, y: 0, width: drawableSize.width - splitX, height: drawableSize.height)
+        if let split = compareSplit, (0.0...1.0).contains(split),
+           let sdr = sdrCIImage, let hdr = hdrCIImage {
+            // Compare mode — left = SDR, right = HDR (regardless of display mode).
+            // The Metal layer needs EDR to show the HDR side, so force EDR on.
+            if !useHDR {
+                applyMetalLayerColorSettings(useHDR: true)
+                rebuildCIContext(useHDR: true)
+            }
+            let splitX     = drawableSize.width * split
+            let leftRect   = CGRect(x: 0,      y: 0, width: splitX,                      height: drawableSize.height)
+            let rightRect  = CGRect(x: splitX, y: 0, width: drawableSize.width - splitX, height: drawableSize.height)
+            let leftSDR    = position(sdr).cropped(to: leftRect)
+            let rightHDR   = position(hdr).cropped(to: rightRect)
 
-            let leftSDR    = sdrVersion.cropped(to: leftRect)
-            let rightHDR   = effectiveHDR() ? hdrVersion.cropped(to: rightRect)
-                                            : sdrVersion.cropped(to: rightRect)
             let dividerW: CGFloat = 2
             let divider = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 1))
                 .cropped(to: CGRect(x: splitX - dividerW/2, y: 0,
@@ -238,13 +264,18 @@ public final class HDRRenderer: NSView {
                 .composited(over: leftSDR)
                 .composited(over: rightHDR)
                 .composited(over: bg)
-        } else if effectiveHDR() {
-            composited = hdrVersion.composited(over: bg)
         } else {
-            composited = sdrVersion.composited(over: bg)
+            // Single-image mode — render the picked variant verbatim.
+            // No tone-mapping needed: SDR base is already in [0…1], HDR
+            // variant has the gain map baked in. CIContext + CAMetalLayer
+            // colorspace pairing handles the rest:
+            //   • SDR mode → sRGB destination → HDR-only files clip naturally.
+            //   • HDR mode → extendedLinearSRGB destination → values >1.0 retained.
+            guard let img = currentImage(useHDR: useHDR) else { return }
+            composited = position(img).composited(over: bg)
         }
 
-        // 4. Blit to the Metal drawable
+        // 3. Blit to the Metal drawable
         guard let cmdBuffer = cmdQueue.makeCommandBuffer() else { return }
         let dest = CIRenderDestination(
             width:         Int(drawableSize.width),
@@ -262,27 +293,6 @@ public final class HDRRenderer: NSView {
         }
         cmdBuffer.present(drawable)
         cmdBuffer.commit()
-    }
-
-    // MARK: - Tone Mapping
-
-    private func applyToneMapping(to image: CIImage,
-                                  mode: ImageViewerConfiguration.ToneMappingMode) -> CIImage {
-        switch mode {
-        case .clamp:
-            return image.applyingFilter("CIColorClamp", parameters: [
-                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
-                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
-            ])
-        case .reinhard, .aces, .auto:
-            return image.applyingFilter("CIToneCurve", parameters: [
-                "inputPoint0": CIVector(x: 0.00, y: 0.00),
-                "inputPoint1": CIVector(x: 0.25, y: 0.18),
-                "inputPoint2": CIVector(x: 0.50, y: 0.50),
-                "inputPoint3": CIVector(x: 0.75, y: 0.82),
-                "inputPoint4": CIVector(x: 1.00, y: 1.00)
-            ])
-        }
     }
 
     // MARK: - HDR Display Detection
@@ -317,10 +327,9 @@ public final class HDRRenderer: NSView {
     }
 
     public func toggleZoomFitOrActual() {
-        guard let ciImage = currentCIImage,
-              let metalLayer = metalLayer else { return }
+        guard let img = anyImage(), let metalLayer = metalLayer else { return }
         let drawableSize = metalLayer.drawableSize
-        let imageSize    = ciImage.extent.size
+        let imageSize    = img.extent.size
         let fitScale     = min(drawableSize.width / imageSize.width,
                                drawableSize.height / imageSize.height)
         let actualZoom = 1.0 / fitScale

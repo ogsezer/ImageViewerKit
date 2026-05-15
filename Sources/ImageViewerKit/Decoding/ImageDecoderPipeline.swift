@@ -16,20 +16,33 @@ public struct DecodedImage {
     /// AppKit-friendly representation, used for thumbnails and UI display.
     public let image: NSImage
 
-    /// HDR-preserving CIImage. Populated when the decoder loaded the file
-    /// via `CIImage(contentsOf:options:[.expandToHDR: true])` (macOS 14+),
-    /// which applies any embedded ISO 21496-1 / Apple gain map natively.
-    /// Renderers should prefer this over the NSImage round-trip — NSImage
-    /// extraction via `cgImage(forProposedRect:...)` clips to SDR.
-    public let ciImage: CIImage?
+    /// SDR base — the image as it is in the file, with NO gain map applied.
+    /// For HEIC/JPEG with embedded gain maps this is the SDR-tone-mapped
+    /// rendition the camera baked into the file.
+    /// For images without a gain map this is just the standard decode.
+    public let sdrCIImage: CIImage?
+
+    /// HDR rendition — gain map applied via `CIImage.expandToHDR`.
+    /// Has values >1.0 in extendedLinearSRGB. nil if the format / OS doesn't
+    /// support gain-map expansion or the file has no HDR data.
+    public let hdrCIImage: CIImage?
 
     public let metadata: ImageMetadata
 
-    public init(image: NSImage, ciImage: CIImage? = nil, metadata: ImageMetadata) {
-        self.image    = image
-        self.ciImage  = ciImage
-        self.metadata = metadata
+    public init(image: NSImage,
+                sdrCIImage: CIImage? = nil,
+                hdrCIImage: CIImage? = nil,
+                metadata: ImageMetadata) {
+        self.image      = image
+        self.sdrCIImage = sdrCIImage
+        self.hdrCIImage = hdrCIImage
+        self.metadata   = metadata
     }
+
+    /// Legacy alias — returns the HDR image when present, falls back to SDR base.
+    /// Renderers should prefer the explicit `sdrCIImage`/`hdrCIImage` fields.
+    @available(*, deprecated, message: "Use sdrCIImage / hdrCIImage explicitly.")
+    public var ciImage: CIImage? { hdrCIImage ?? sdrCIImage }
 }
 
 /// Rich metadata extracted alongside the image data.
@@ -144,17 +157,16 @@ final class ImageIODecoder: ImageDecoder {
         let hasAppleGainMap = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0, appleGainMapType) != nil
         let hasGainMap      = hasISOGainMap || hasAppleGainMap
 
-        // ── Step 2: HDR-preserving CIImage via Core Image ──────────────────
-        // CIImage(contentsOf:options:[.expandToHDR: true]) is the Apple-blessed
-        // path that:
-        //   1. Decodes the SDR base
-        //   2. Decodes the embedded gain map auxiliary
-        //   3. Applies the gain-map formula  hdr = sdr × gain
-        //   4. Returns a CIImage in extendedLinearSRGB with values >1.0
+        // ── Step 2: Load both SDR and HDR variants ─────────────────────────
+        // For files with gain maps (iPhone HDR HEIC, modern HDR JPEG):
+        //   • sdrCIImage = SDR base, no gain map applied — values ∈ [0, 1]
+        //   • hdrCIImage = SDR base × gain map applied   — values may be >1.0
+        // For files without gain maps both decodes return the same content.
         //
-        // This bypasses the NSImage→CGImage round-trip that AppKit performs
-        // through Quartz, which clips extended values to SDR.
-        var hdrCIImage: CIImage?
+        // Loading both lets the renderer simply pick the right one per frame
+        // based on display mode — no hacky tone-mapping, no re-decode on toggle.
+        let sdrCIImage: CIImage? = CIImage(contentsOf: url)
+        var hdrCIImage: CIImage? = nil
         if #available(macOS 14.0, *) {
             // Use raw value to be SDK-version-tolerant.
             let expandKey = CIImageOption(rawValue: "kCIImageExpandToHDR")
@@ -219,13 +231,19 @@ final class ImageIODecoder: ImageDecoder {
           colorSpace      = \(meta.colorSpace)
           hasISOGainMap   = \(hasISOGainMap)
           hasAppleGainMap = \(hasAppleGainMap)
-          gainMap applied = \(hdrCIImage != nil)  (via CIImage.expandToHDR)
+          sdrCIImage      = \(sdrCIImage != nil ? "loaded" : "nil")
+          hdrCIImage      = \(hdrCIImage != nil ? "loaded (gain map applied)" : "nil")
           headroom        = \(String(format: "%.2f×", meta.headroom))
           isHDR           = \(meta.isHDR)
         """)
         #endif
 
-        return DecodedImage(image: nsImage, ciImage: hdrCIImage, metadata: meta)
+        return DecodedImage(
+            image: nsImage,
+            sdrCIImage: sdrCIImage,
+            hdrCIImage: hdrCIImage,
+            metadata: meta
+        )
     }
 }
 
