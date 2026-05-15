@@ -120,17 +120,33 @@ final class ImageIODecoder: ImageDecoder {
         var headroom: Float = 1.0
 
         if #available(macOS 14.0, *) {
+            // Note: `kCGImageSourceDecodeRequest` is exposed as a Swift symbol,
+            // but `kCGImageSourceDecodeRequestHDRImage` (the *value*) is not yet
+            // surfaced in many SDKs. Use the documented CFString literal so this
+            // builds against any macOS 14+ SDK.
+            let hdrImageValue = "kCGImageSourceDecodeRequestHDRImage" as CFString
             let hdrOptions: [CFString: Any] = [
-                kCGImageSourceDecodeRequest: kCGImageSourceDecodeRequestHDRImage
+                kCGImageSourceDecodeRequest: hdrImageValue
             ]
             cgImage = CGImageSourceCreateImageAtIndex(source, 0, hdrOptions as CFDictionary)
 
-            // Extract content headroom (the actual HDR boost baked into the pixels).
+            // Extract the actual HDR boost baked into the pixels.
+            //   • macOS 15+: CIImage.contentHeadroom gives the precise value.
+            //   • macOS 14:  no public API — approximate from pixel format.
             if let cg = cgImage {
-                let ci = CIImage(cgImage: cg)
-                if #available(macOS 14.0, *) {
+                if #available(macOS 15.0, *) {
+                    let ci = CIImage(cgImage: cg)
                     let h = Float(ci.contentHeadroom)
                     if h > 0, h.isFinite { headroom = h }
+                } else {
+                    // macOS 14 fallback: if the HDR decode produced a deeper-than-8-bit
+                    // pixel buffer or an extended-range colorspace, assume HDR content
+                    // with a conservative 2.0× headroom estimate.
+                    let isExtendedRange: Bool = cg.colorSpace
+                        .map { CGColorSpaceUsesExtendedRange($0) } ?? false
+                    if cg.bitsPerComponent > 8 || isExtendedRange {
+                        headroom = 2.0
+                    }
                 }
             }
         }
