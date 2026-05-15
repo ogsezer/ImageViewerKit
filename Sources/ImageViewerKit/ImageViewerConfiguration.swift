@@ -12,9 +12,18 @@ public struct ImageViewerConfiguration {
 
     // MARK: - HDR & Color
 
-    /// Enable Metal EDR (Extended Dynamic Range) rendering on supported displays.
-    /// Falls back gracefully to SDR on non-HDR screens. Default: true.
-    public var allowsHDR: Bool = true
+    /// Display mode controlling SDR/HDR rendering. Default: `.auto`.
+    /// Can be changed at runtime via the in-viewer toggle or `HDRRenderer.displayMode`.
+    public var displayMode: DisplayMode = .auto
+
+    /// Legacy boolean alias for `displayMode`.
+    /// `true` ⇒ `.auto`; `false` ⇒ `.sdr`.
+    @available(*, deprecated, renamed: "displayMode",
+               message: "Use displayMode (.sdr / .hdr / .auto) instead.")
+    public var allowsHDR: Bool {
+        get { displayMode != .sdr }
+        set { displayMode = newValue ? .auto : .sdr }
+    }
 
     /// Color space used for SDR fallback rendering. Default: sRGB.
     public var sdrColorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -32,6 +41,9 @@ public struct ImageViewerConfiguration {
 
     /// Show toolbar with zoom, rotate, fullscreen controls. Default: true.
     public var showsToolbar: Bool = true
+
+    /// Show floating SDR/HDR/Auto display-mode toggle in the canvas corner. Default: true.
+    public var showsDisplayModeToggle: Bool = true
 
     /// Background colour behind the image canvas. Default: near-black.
     public var backgroundColor: NSColor = NSColor(white: 0.08, alpha: 1.0)
@@ -91,10 +103,11 @@ public struct ImageViewerConfiguration {
     /// Minimal configuration — no chrome, black background, HDR on.
     public static var minimal: ImageViewerConfiguration {
         var c = ImageViewerConfiguration()
-        c.showsThumbnailStrip = false
-        c.showsMetadataPanel  = false
-        c.showsToolbar        = false
-        c.backgroundColor     = .black
+        c.showsThumbnailStrip      = false
+        c.showsMetadataPanel       = false
+        c.showsToolbar             = false
+        c.showsDisplayModeToggle   = false
+        c.backgroundColor          = .black
         return c
     }
 
@@ -109,6 +122,44 @@ public struct ImageViewerConfiguration {
 // MARK: - Supporting Enums
 
 public extension ImageViewerConfiguration {
+
+    /// How the viewer should render image dynamic range.
+    enum DisplayMode: String, CaseIterable, Sendable {
+        /// Force standard dynamic range — tone-map any HDR content into [0…1].
+        case sdr
+        /// Force HDR with EDR (Extended Dynamic Range) on supported displays.
+        /// On non-HDR displays the system clips at SDR white — same as .sdr visually.
+        case hdr
+        /// Use HDR if the current display supports it, otherwise SDR.
+        case auto
+
+        /// Short label suitable for badges and toolbar buttons.
+        public var displayName: String {
+            switch self {
+            case .sdr:  return "SDR"
+            case .hdr:  return "HDR"
+            case .auto: return "Auto"
+            }
+        }
+
+        /// SF Symbol name for use in toolbar/overlay buttons.
+        public var symbolName: String {
+            switch self {
+            case .sdr:  return "sun.min"
+            case .hdr:  return "sun.max.fill"
+            case .auto: return "circle.righthalf.filled"
+            }
+        }
+
+        /// Cycle to the next mode: auto → hdr → sdr → auto.
+        public func cycled() -> DisplayMode {
+            switch self {
+            case .auto: return .hdr
+            case .hdr:  return .sdr
+            case .sdr:  return .auto
+            }
+        }
+    }
 
     /// How HDR content is tone-mapped when shown on an SDR display.
     enum ToneMappingMode {

@@ -10,6 +10,7 @@
 // Decoding is fully async via ImageDecoderPipeline — the UI never blocks.
 
 import AppKit
+import SwiftUI
 import Foundation
 
 @MainActor
@@ -36,6 +37,7 @@ public final class ImageViewerViewController: NSViewController {
     private var toolbarView: ViewerToolbarView?
     private var metadataView: MetadataView?
     private var loadingIndicator: NSProgressIndicator!
+    private var displayModeHost: NSHostingView<DisplayModeToggleView>?
 
     // MARK: - Init: URLs
 
@@ -83,9 +85,10 @@ public final class ImageViewerViewController: NSViewController {
         super.viewDidLoad()
         setupHDRRenderer()
         setupLoadingIndicator()
-        if configuration.showsToolbar        { setupToolbar() }
-        if configuration.showsThumbnailStrip { setupThumbnailStrip() }
-        if configuration.showsMetadataPanel  { setupMetadataPanel() }
+        if configuration.showsToolbar            { setupToolbar() }
+        if configuration.showsThumbnailStrip     { setupThumbnailStrip() }
+        if configuration.showsMetadataPanel      { setupMetadataPanel() }
+        if configuration.showsDisplayModeToggle  { setupDisplayModeToggle() }
         setupKeyboardShortcuts()
         setupGestures()
 
@@ -162,6 +165,43 @@ public final class ImageViewerViewController: NSViewController {
             meta.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -88),
         ])
         self.metadataView = meta
+    }
+
+    // MARK: - Display Mode Toggle (floating overlay)
+
+    private func setupDisplayModeToggle() {
+        let toggle = DisplayModeToggleView(
+            mode: hdrRenderer.displayMode,
+            displaySupportsHDR: hdrRenderer.currentDisplaySupportsHDR,
+            onTap: { [weak self] in self?.cycleDisplayMode() }
+        )
+        let host = NSHostingView(rootView: toggle)
+        host.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(host)
+        NSLayoutConstraint.activate([
+            host.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            host.topAnchor.constraint(
+                equalTo: view.topAnchor,
+                constant: configuration.showsToolbar ? 60 : 16
+            )
+        ])
+        self.displayModeHost = host
+    }
+
+    /// Refresh the SwiftUI badge after the renderer's mode changes.
+    private func refreshDisplayModeToggle() {
+        guard let host = displayModeHost else { return }
+        host.rootView = DisplayModeToggleView(
+            mode: hdrRenderer.displayMode,
+            displaySupportsHDR: hdrRenderer.currentDisplaySupportsHDR,
+            onTap: { [weak self] in self?.cycleDisplayMode() }
+        )
+    }
+
+    /// Public for keyboard shortcut + button. Cycles SDR → HDR → Auto.
+    private func cycleDisplayMode() {
+        hdrRenderer.cycleDisplayMode()
+        refreshDisplayModeToggle()
     }
 
     // MARK: - Image Loading
@@ -247,6 +287,7 @@ public final class ImageViewerViewController: NSViewController {
         case 53:  view.window?.close()       // Esc
         case 3:   hdrRenderer.zoomToFit()   // F — fit
         case 29:  hdrRenderer.zoomTo(1.0)   // 0 — 100%
+        case 4:   cycleDisplayMode()        // H — cycle SDR/HDR/Auto
         default:  super.keyDown(with: event)
         }
     }
