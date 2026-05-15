@@ -29,7 +29,16 @@ public struct ImageMetadata {
     public var fileSize: Int64    = 0
     public var exif: [String: Any] = [:]
 
+    /// HDR headroom of the decoded image:
+    ///   • 1.0  →  no HDR boost (plain SDR)
+    ///   • >1.0 →  pixels carry HDR data; e.g. 2.4 means highlights up to 2.4× SDR white
+    /// Set by the decoder via `CIImage.contentHeadroom` (macOS 14+) when available.
+    public var headroom: Float = 1.0
+
     public var dimensionString: String { "\(width) × \(height) px" }
+
+    /// Whether this image has actual HDR pixel data (not just an HDR-capable container).
+    public var hasHDRContent: Bool { headroom > 1.001 }
 }
 
 // MARK: - Decoder Protocol
@@ -86,6 +95,13 @@ final class ImageDecoderPipeline {
 
 /// Handles HEIC, AVIF, WebP, PNG, JPEG, GIF, TIFF, BMP, ICO, PDF via Apple ImageIO.
 /// Fastest on Apple Silicon — hardware-accelerated.
+///
+/// HDR support:
+///   • macOS 14+: requests HDR decoding via `kCGImageSourceDecodeRequest`.
+///     ImageIO automatically reads any embedded ISO 21496-1 gain map (used by
+///     iPhone HEIC photos and modern HDR JPEGs), composites it onto the SDR
+///     base, and returns a CGImage with HDR pixel values + content headroom.
+///   • macOS 13:   falls back to standard SDR decode.
 final class ImageIODecoder: ImageDecoder {
 
     let supportedExtensions: Set<String> = [
@@ -98,18 +114,43 @@ final class ImageIODecoder: ImageDecoder {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             throw ImageViewerError.fileNotFound(url)
         }
-        guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+
+        // Try HDR-aware decode first (macOS 14+)
+        var cgImage: CGImage?
+        var headroom: Float = 1.0
+
+        if #available(macOS 14.0, *) {
+            let hdrOptions: [CFString: Any] = [
+                kCGImageSourceDecodeRequest: kCGImageSourceDecodeRequestHDRImage
+            ]
+            cgImage = CGImageSourceCreateImageAtIndex(source, 0, hdrOptions as CFDictionary)
+
+            // Extract content headroom (the actual HDR boost baked into the pixels).
+            if let cg = cgImage {
+                let ci = CIImage(cgImage: cg)
+                if #available(macOS 14.0, *) {
+                    let h = Float(ci.contentHeadroom)
+                    if h > 0, h.isFinite { headroom = h }
+                }
+            }
+        }
+
+        // Fallback: standard SDR decode (macOS 13 or HDR decode unavailable for this format)
+        if cgImage == nil {
+            cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        }
+
+        guard let cgImage else {
             throw ImageViewerError.decodeFailed(url, underlying: nil)
         }
 
-        let image = NSImage(cgImage: cgImage, size: NSSize(
-            width: cgImage.width, height: cgImage.height)
-        )
+        let image = NSImage(cgImage: cgImage,
+                            size: NSSize(width: cgImage.width, height: cgImage.height))
 
-        // Extract metadata from ImageIO properties
+        // Extract metadata
         let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
-        let exif   = props[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
-        let attrs  = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let exif  = props[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
 
         var meta = ImageMetadata()
         meta.width      = cgImage.width
@@ -119,7 +160,8 @@ final class ImageIODecoder: ImageDecoder {
         meta.format     = url.pathExtension.uppercased()
         meta.fileSize   = (attrs?[.size] as? Int64) ?? 0
         meta.exif       = exif
-        meta.isHDR      = cgImage.bitsPerComponent > 8
+        meta.headroom   = headroom
+        meta.isHDR      = headroom > 1.001 || cgImage.bitsPerComponent > 8
         meta.colorSpace = cgImage.colorSpace?.name as String? ?? "Unknown"
 
         return DecodedImage(image: image, metadata: meta)

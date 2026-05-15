@@ -16,6 +16,10 @@ public struct ImageViewerConfiguration {
     /// Can be changed at runtime via the in-viewer toggle or `HDRRenderer.displayMode`.
     public var displayMode: DisplayMode = .auto
 
+    /// Compare mode — render two views of the same image side by side.
+    /// Useful for visually verifying the SDR/HDR difference. Default: `.off`.
+    public var compareMode: CompareMode = .off
+
     /// Legacy boolean alias for `displayMode`.
     /// `true` ⇒ `.auto`; `false` ⇒ `.sdr`.
     @available(*, deprecated, renamed: "displayMode",
@@ -157,6 +161,22 @@ public extension ImageViewerConfiguration {
             case .auto: return .hdr
             case .hdr:  return .sdr
             case .sdr:  return .auto
+            }
+        }
+    }
+
+    /// Side-by-side compare mode for visual SDR vs HDR comparison.
+    enum CompareMode: String, CaseIterable, Sendable {
+        /// No comparison — single rendering using the current displayMode.
+        case off
+        /// Vertical split: SDR (tone-mapped) on the left, HDR on the right,
+        /// with a thin divider line. Overrides displayMode while active.
+        case sideBySide
+
+        public func cycled() -> CompareMode {
+            switch self {
+            case .off:        return .sideBySide
+            case .sideBySide: return .off
             }
         }
     }

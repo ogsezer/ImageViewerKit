@@ -7,14 +7,13 @@
 //
 // Display mode is RUNTIME-MUTABLE: setting `displayMode` reconfigures the
 // CAMetalLayer (EDR flag, colorspace) and CIContext (working/output space)
-// in place, then triggers a re-render. The same image will appear in SDR
-// or HDR depending on the current mode.
+// in place, then triggers a re-render.
 //
-// Layout model:
-//   • `userZoom`  is a MULTIPLIER on the fit-to-view scale (1.0 = exactly fit).
-//   • `userPan`   is an additional offset in drawable pixels (0,0 = centred).
-//   • The actual display transform is recomputed every render(), so the image
-//     re-centers correctly whenever the view resizes.
+// Compare mode (v1.2.0):
+//   Set `compareSplit` to a value in 0…1 to render the LEFT half tone-mapped
+//   to SDR and the RIGHT half in HDR (with a thin white divider). Set to nil
+//   to disable. The PixelDrop app drives this from cursor X position when the
+//   user presses 'C'.
 
 import AppKit
 import Metal
@@ -36,20 +35,33 @@ public final class HDRRenderer: NSView {
     // MARK: - Image State
 
     private var currentCIImage: CIImage?
-    private var userZoom: CGFloat   = 1.0      // 1.0 = fit to view
-    private var rotation: CGFloat   = 0.0      // degrees
-    private var userPan: CGPoint    = .zero    // drawable-pixel offset
+
+    /// HDR headroom of the currently-displayed image (1.0 = SDR, >1.0 = HDR).
+    public private(set) var currentImageHeadroom: Float = 1.0
+
+    private var userZoom: CGFloat   = 1.0
+    private var rotation: CGFloat   = 0.0
+    private var userPan: CGPoint    = .zero
     private var hasUserAdjustedZoom = false
 
     // MARK: - Configuration
 
     private let configuration: ImageViewerConfiguration
 
-    /// Current display mode. Setting this reconfigures Metal/CI on the fly.
+    /// Current display mode. Setting reconfigures Metal/CI on the fly.
     public var displayMode: ImageViewerConfiguration.DisplayMode {
         didSet {
             guard oldValue != displayMode else { return }
             reconfigureForDisplayMode()
+            render()
+        }
+    }
+
+    /// Side-by-side compare. nil = disabled. 0…1 = horizontal split position.
+    /// Left half = SDR (tone-mapped), right half = HDR.
+    public var compareSplit: CGFloat? {
+        didSet {
+            guard oldValue != compareSplit else { return }
             render()
         }
     }
@@ -70,7 +82,6 @@ public final class HDRRenderer: NSView {
 
     private func setupMetal() {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-
         self.metalDevice  = device
         self.commandQueue = device.makeCommandQueue()
 
@@ -91,7 +102,6 @@ public final class HDRRenderer: NSView {
 
     // MARK: - Display Mode Reconfiguration
 
-    /// Compute whether HDR should actually be on, given the current mode + display.
     private func effectiveHDR() -> Bool {
         switch displayMode {
         case .sdr:  return false
@@ -131,15 +141,17 @@ public final class HDRRenderer: NSView {
 
     // MARK: - Display
 
-    /// Display an NSImage. Resets zoom/pan so the new image fits-to-view.
-    public func display(image: NSImage, configuration: ImageViewerConfiguration) {
+    /// Display an NSImage with optional HDR headroom info from the decoder.
+    public func display(image: NSImage,
+                        headroom: Float = 1.0,
+                        configuration: ImageViewerConfiguration) {
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
-        currentCIImage      = CIImage(cgImage: cgImage)
-        userZoom            = 1.0
-        userPan             = .zero
-        rotation            = 0
-        hasUserAdjustedZoom = false
-        // Wait until the next layout pass — bounds may still be zero here.
+        currentCIImage         = CIImage(cgImage: cgImage)
+        currentImageHeadroom   = max(1.0, headroom)
+        userZoom               = 1.0
+        userPan                = .zero
+        rotation               = 0
+        hasUserAdjustedZoom    = false
         DispatchQueue.main.async { [weak self] in self?.render() }
     }
 
@@ -156,7 +168,7 @@ public final class HDRRenderer: NSView {
             let ciContext  = ciContext
         else { return }
 
-        // 1. Compute the proper transform
+        // 1. Compute transform (centred + scaled to fit + user zoom/pan)
         let drawableSize = CGSize(width:  drawable.texture.width,
                                   height: drawable.texture.height)
         let imageSize    = ciImage.extent.size
@@ -168,35 +180,54 @@ public final class HDRRenderer: NSView {
                               drawableSize.height / imageBoundH)
         let scale       = fitScale * userZoom
 
-        // 2. Build the chained transform — rotate around centre, scale, translate
-        let rotation = CGAffineTransform.identity
-            .translatedBy(x:  imageSize.width  / 2,
-                          y:  imageSize.height / 2)
+        let rotXfm = CGAffineTransform.identity
+            .translatedBy(x: imageSize.width / 2, y: imageSize.height / 2)
             .rotated(by: self.rotation * .pi / 180)
-            .translatedBy(x: -imageSize.width  / 2,
-                          y: -imageSize.height / 2)
+            .translatedBy(x: -imageSize.width / 2, y: -imageSize.height / 2)
 
-        var transformed = ciImage.transformed(by: rotation)
-        transformed = transformed.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        var positioned = ciImage.transformed(by: rotXfm)
+        positioned = positioned.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
-        let scaledExtent = transformed.extent
-        let tx = (drawableSize.width  - scaledExtent.width)  / 2 - scaledExtent.origin.x + userPan.x
-        let ty = (drawableSize.height - scaledExtent.height) / 2 - scaledExtent.origin.y + userPan.y
-        transformed = transformed.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+        let extent = positioned.extent
+        let tx = (drawableSize.width  - extent.width)  / 2 - extent.origin.x + userPan.x
+        let ty = (drawableSize.height - extent.height) / 2 - extent.origin.y + userPan.y
+        positioned = positioned.transformed(by: CGAffineTransform(translationX: tx, y: ty))
 
-        // 3. Tone-map only when forcing SDR (or auto on a non-HDR display)
-        if !effectiveHDR() {
-            transformed = applyToneMapping(to: transformed, mode: configuration.toneMappingMode)
+        // 2. Build the SDR and HDR variants we may need
+        let hdrVersion = positioned                                     // pixels keep headroom
+        let sdrVersion = applyToneMapping(to: positioned,               // tone-mapped to [0..1]
+                                          mode: configuration.toneMappingMode)
+
+        // 3. Choose final composite based on mode + compare split
+        let drawableRect = CGRect(origin: .zero, size: drawableSize)
+        let bg = CIImage(color: CIColor.black).cropped(to: drawableRect)
+        var composited: CIImage
+
+        if let split = compareSplit, (0.0...1.0).contains(split) {
+            // Compare mode — left = SDR, right = HDR, divider in the middle
+            let splitX = drawableSize.width * split
+            let leftRect  = CGRect(x: 0,      y: 0, width: splitX,                    height: drawableSize.height)
+            let rightRect = CGRect(x: splitX, y: 0, width: drawableSize.width - splitX, height: drawableSize.height)
+
+            let leftSDR    = sdrVersion.cropped(to: leftRect)
+            let rightHDR   = effectiveHDR() ? hdrVersion.cropped(to: rightRect)
+                                            : sdrVersion.cropped(to: rightRect)
+            let dividerW: CGFloat = 2
+            let divider = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 1))
+                .cropped(to: CGRect(x: splitX - dividerW/2, y: 0,
+                                    width: dividerW, height: drawableSize.height))
+            composited = divider
+                .composited(over: leftSDR)
+                .composited(over: rightHDR)
+                .composited(over: bg)
+        } else if effectiveHDR() {
+            composited = hdrVersion.composited(over: bg)
+        } else {
+            composited = sdrVersion.composited(over: bg)
         }
 
-        // 4. Composite over black so areas outside the image are filled
-        let bg = CIImage(color: CIColor.black)
-            .cropped(to: CGRect(origin: .zero, size: drawableSize))
-        let composited = transformed.composited(over: bg)
-
-        // 5. Blit to the Metal drawable
+        // 4. Blit to the Metal drawable
         guard let cmdBuffer = cmdQueue.makeCommandBuffer() else { return }
-
         let dest = CIRenderDestination(
             width:         Int(drawableSize.width),
             height:        Int(drawableSize.height),
@@ -204,15 +235,13 @@ public final class HDRRenderer: NSView {
             commandBuffer: cmdBuffer,
             mtlTextureProvider: { drawable.texture }
         )
-
         do {
             try ciContext.startTask(toRender: composited,
-                                    from: CGRect(origin: .zero, size: drawableSize),
+                                    from: drawableRect,
                                     to: dest, at: .zero)
         } catch {
             print("[ImageViewerKit] Render error: \(error)")
         }
-
         cmdBuffer.present(drawable)
         cmdBuffer.commit()
     }
@@ -245,8 +274,6 @@ public final class HDRRenderer: NSView {
         return screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0
     }
 
-    /// Public helper: does the current display support HDR?
-    /// Useful for showing badge text like "(unavailable on this screen)".
     public var currentDisplaySupportsHDR: Bool { displaySupportsHDR() }
 
     // MARK: - Zoom & Pan API
@@ -279,11 +306,7 @@ public final class HDRRenderer: NSView {
         let fitScale     = min(drawableSize.width / imageSize.width,
                                drawableSize.height / imageSize.height)
         let actualZoom = 1.0 / fitScale
-        if abs(userZoom - actualZoom) < 0.01 {
-            zoomToFit()
-        } else {
-            zoomTo(actualZoom)
-        }
+        if abs(userZoom - actualZoom) < 0.01 { zoomToFit() } else { zoomTo(actualZoom) }
     }
 
     public func rotate(by degrees: CGFloat) {
@@ -291,14 +314,18 @@ public final class HDRRenderer: NSView {
         render()
     }
 
-    /// Cycle SDR → HDR → Auto → SDR. Returns the new mode.
     @discardableResult
     public func cycleDisplayMode() -> ImageViewerConfiguration.DisplayMode {
         displayMode = displayMode.cycled()
         return displayMode
     }
 
-    // MARK: - Gesture Handling
+    /// Toggle compare mode. When enabling, defaults the split to 50%.
+    public func toggleCompareMode() {
+        compareSplit = (compareSplit == nil) ? 0.5 : nil
+    }
+
+    // MARK: - Gestures
 
     public override func magnify(with event: NSEvent) {
         guard configuration.allowsPinchZoom else { return }
@@ -328,7 +355,6 @@ public final class HDRRenderer: NSView {
         if let scale = window?.backingScaleFactor {
             metalLayer?.contentsScale = scale
         }
-        // .auto might resolve differently now that we know which display we're on
         if displayMode == .auto { reconfigureForDisplayMode() }
     }
 }

@@ -173,6 +173,8 @@ public final class ImageViewerViewController: NSViewController {
         let toggle = DisplayModeToggleView(
             mode: hdrRenderer.displayMode,
             displaySupportsHDR: hdrRenderer.currentDisplaySupportsHDR,
+            imageHeadroom: hdrRenderer.currentImageHeadroom,
+            isComparing: hdrRenderer.compareSplit != nil,
             onTap: { [weak self] in self?.cycleDisplayMode() }
         )
         let host = NSHostingView(rootView: toggle)
@@ -188,12 +190,14 @@ public final class ImageViewerViewController: NSViewController {
         self.displayModeHost = host
     }
 
-    /// Refresh the SwiftUI badge after the renderer's mode changes.
+    /// Refresh the SwiftUI badge after the renderer's mode/headroom/compare state changes.
     private func refreshDisplayModeToggle() {
         guard let host = displayModeHost else { return }
         host.rootView = DisplayModeToggleView(
             mode: hdrRenderer.displayMode,
             displaySupportsHDR: hdrRenderer.currentDisplaySupportsHDR,
+            imageHeadroom: hdrRenderer.currentImageHeadroom,
+            isComparing: hdrRenderer.compareSplit != nil,
             onTap: { [weak self] in self?.cycleDisplayMode() }
         )
     }
@@ -201,6 +205,12 @@ public final class ImageViewerViewController: NSViewController {
     /// Public for keyboard shortcut + button. Cycles SDR → HDR → Auto.
     private func cycleDisplayMode() {
         hdrRenderer.cycleDisplayMode()
+        refreshDisplayModeToggle()
+    }
+
+    /// Toggle side-by-side SDR vs HDR compare view.
+    private func toggleCompareMode() {
+        hdrRenderer.compareSplit = (hdrRenderer.compareSplit == nil) ? 0.5 : nil
         refreshDisplayModeToggle()
     }
 
@@ -224,7 +234,12 @@ public final class ImageViewerViewController: NSViewController {
                 let result = try await decoderPipeline.decode(url: url)
                 await MainActor.run {
                     self.showLoading(false)
-                    self.hdrRenderer.display(image: result.image, configuration: self.configuration)
+                    self.hdrRenderer.display(
+                        image: result.image,
+                        headroom: result.metadata.headroom,
+                        configuration: self.configuration
+                    )
+                    self.refreshDisplayModeToggle()
                     self.metadataView?.update(with: result.metadata)
                     self.thumbnailStripView?.select(index: index)
                     self.view.window?.title = url.lastPathComponent
@@ -288,6 +303,7 @@ public final class ImageViewerViewController: NSViewController {
         case 3:   hdrRenderer.zoomToFit()   // F — fit
         case 29:  hdrRenderer.zoomTo(1.0)   // 0 — 100%
         case 4:   cycleDisplayMode()        // H — cycle SDR/HDR/Auto
+        case 8:   toggleCompareMode()       // C — toggle SDR|HDR side-by-side compare
         default:  super.keyDown(with: event)
         }
     }
