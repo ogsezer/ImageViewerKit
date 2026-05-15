@@ -299,35 +299,48 @@ extension ImageViewerViewController: ThumbnailStripDelegate {
 
 // MARK: - Stub UI Types
 // These are minimal stubs. Replace with full SwiftUI or AppKit implementations.
+// NOTE: Delegate typealiases point to the top-level protocols so that
+//       ImageViewerViewController's extension conformances satisfy them directly.
 
-final class ViewerToolbarView: NSView {
-    @MainActor protocol Delegate: AnyObject {
-        func toolbarDidTapZoomIn(); func toolbarDidTapZoomOut()
-        func toolbarDidTapZoomToFit(); func toolbarDidTapRotateCW()
-        func toolbarDidTapRotateCCW(); func toolbarDidTapFullscreen()
-        func toolbarDidTapMetadata(); func toolbarDidTapShare(from: NSRect)
-    }
-    init(delegate: any Delegate) { super.init(frame: .zero) }
-    required init?(coder: NSCoder) { fatalError() }
-}
+// ── Toolbar ──────────────────────────────────────────────────────────────────
 
 @MainActor protocol ViewerToolbarDelegate: AnyObject {
-    func toolbarDidTapZoomIn(); func toolbarDidTapZoomOut()
-    func toolbarDidTapZoomToFit(); func toolbarDidTapRotateCW()
-    func toolbarDidTapRotateCCW(); func toolbarDidTapFullscreen()
-    func toolbarDidTapMetadata(); func toolbarDidTapShare(from: NSRect)
+    func toolbarDidTapZoomIn()
+    func toolbarDidTapZoomOut()
+    func toolbarDidTapZoomToFit()
+    func toolbarDidTapRotateCW()
+    func toolbarDidTapRotateCCW()
+    func toolbarDidTapFullscreen()
+    func toolbarDidTapMetadata()
+    func toolbarDidTapShare(from: NSRect)
 }
 
-final class ThumbnailStripView: NSView {
-    @MainActor protocol Delegate: AnyObject { func thumbnailStrip(didSelect: Int) }
-    init(urls: [URL], selectedIndex: Int, delegate: any Delegate) { super.init(frame: .zero) }
+final class ViewerToolbarView: NSView {
+    /// Alias to the top-level protocol — removes the duplicate nested protocol
+    /// so `ImageViewerViewController` (which conforms to `ViewerToolbarDelegate`)
+    /// satisfies `ViewerToolbarView.Delegate` without extra conformances.
+    typealias Delegate = ViewerToolbarDelegate
+
+    init(delegate: any ViewerToolbarDelegate) { super.init(frame: .zero) }
     required init?(coder: NSCoder) { fatalError() }
-    func update(urls: [URL], selectedIndex: Int) {}
-    func select(index: Int) {}
 }
+
+// ── Thumbnail Strip ───────────────────────────────────────────────────────────
 
 @MainActor protocol ThumbnailStripDelegate: AnyObject {
     func thumbnailStrip(didSelect index: Int)
+}
+
+final class ThumbnailStripView: NSView {
+    /// Same pattern — alias points to the top-level protocol.
+    typealias Delegate = ThumbnailStripDelegate
+
+    init(urls: [URL], selectedIndex: Int, delegate: any ThumbnailStripDelegate) {
+        super.init(frame: .zero)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func update(urls: [URL], selectedIndex: Int) {}
+    func select(index: Int) {}
 }
 
 final class MetadataView: NSView {
