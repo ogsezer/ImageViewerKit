@@ -7,6 +7,7 @@
 import AppKit
 import ImageIO
 import Foundation
+import CryptoKit   // Insecure.MD5 for cache key hashing
 
 // MARK: - Cache Entry
 
@@ -174,14 +175,17 @@ public final class ThumbnailCache {
 
     // MARK: - Helpers
 
+    /// Build a stable, filesystem-safe cache key from a URL path.
+    ///
+    /// Earlier versions base64-encoded the full path, which produced filenames
+    /// up to ~400 chars for deeply nested files — well over macOS's 255-byte
+    /// filename limit (errno 63 ENAMETOOLONG). We now hash the path to a fixed
+    /// 32-char MD5 hex string. MD5 is fine here: collision-resistance isn't
+    /// security-critical for a thumbnail cache.
     private func cacheKey(for url: URL) -> String {
-        // Stable key: URL path hashed to a safe filename
-        return url.path
-            .data(using: .utf8)
-            .map { Data($0).base64EncodedString()
-                .replacingOccurrences(of: "/", with: "_")
-                .replacingOccurrences(of: "+", with: "-")
-            } ?? url.lastPathComponent
+        let pathBytes = Data(url.path.utf8)
+        let digest = Insecure.MD5.hash(data: pathBytes)
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private func fileModDate(url: URL) -> Date? {
