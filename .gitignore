@@ -1,0 +1,11 @@
+# .gitignore for ImageViewerKit
+.DS_Store
+.build/
+*.o
+*.d
+*.xcodeproj/
+xcuserdata/
+*.xcworkspace/
+DerivedData/
+.swiftpm/
+*.resolved
