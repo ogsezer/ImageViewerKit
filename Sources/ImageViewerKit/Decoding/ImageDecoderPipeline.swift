@@ -35,10 +35,15 @@ public struct ImageMetadata {
     /// Set by the decoder via `CIImage.contentHeadroom` (macOS 14+) when available.
     public var headroom: Float = 1.0
 
+    /// True if the file has an embedded ISO 21496-1 (modern) or Apple HDR gain map.
+    /// Detected via `CGImageSourceCopyAuxiliaryDataInfoAtIndex` — works on all
+    /// supported macOS versions, regardless of decode API availability.
+    public var hasGainMap: Bool = false
+
     public var dimensionString: String { "\(width) × \(height) px" }
 
     /// Whether this image has actual HDR pixel data (not just an HDR-capable container).
-    public var hasHDRContent: Bool { headroom > 1.001 }
+    public var hasHDRContent: Bool { headroom > 1.001 || hasGainMap }
 }
 
 // MARK: - Decoder Protocol
@@ -115,55 +120,77 @@ final class ImageIODecoder: ImageDecoder {
             throw ImageViewerError.fileNotFound(url)
         }
 
-        // Try HDR-aware decode first (macOS 14+)
+        // ── Step 1: Detect gain map directly via auxiliary data ────────────
+        // This works on ALL macOS versions, regardless of whether the HDR
+        // decode API is available. iPhone HEIC photos taken with HDR on
+        // contain either an ISO 21496-1 gain map (newer) or Apple's older
+        // HDRGainMap auxiliary type.
+        let isoGainMapType   = "kCGImageAuxiliaryDataTypeISOGainMap"   as CFString
+        let appleGainMapType = "kCGImageAuxiliaryDataTypeHDRGainMap"   as CFString
+
+        let hasISOGainMap   = CGImageSourceCopyAuxiliaryDataInfoAtIndex(
+            source, 0, isoGainMapType
+        ) != nil
+        let hasAppleGainMap = CGImageSourceCopyAuxiliaryDataInfoAtIndex(
+            source, 0, appleGainMapType
+        ) != nil
+        let hasGainMap      = hasISOGainMap || hasAppleGainMap
+
+        // ── Step 2: Try HDR-aware decode (macOS 14+) ───────────────────────
         var cgImage: CGImage?
         var headroom: Float = 1.0
+        var hdrDecodeSucceeded = false
 
         if #available(macOS 14.0, *) {
-            // Note: `kCGImageSourceDecodeRequest` is exposed as a Swift symbol,
-            // but `kCGImageSourceDecodeRequestHDRImage` (the *value*) is not yet
-            // surfaced in many SDKs. Use the documented CFString literal so this
-            // builds against any macOS 14+ SDK.
+            // The Swift symbol `kCGImageSourceDecodeRequestHDRImage` isn't
+            // surfaced in many SDKs. Use the documented CFString value.
             let hdrImageValue = "kCGImageSourceDecodeRequestHDRImage" as CFString
             let hdrOptions: [CFString: Any] = [
                 kCGImageSourceDecodeRequest: hdrImageValue
             ]
             cgImage = CGImageSourceCreateImageAtIndex(source, 0, hdrOptions as CFDictionary)
+            hdrDecodeSucceeded = (cgImage != nil)
 
-            // Extract the actual HDR boost baked into the pixels.
-            //   • macOS 15+: CIImage.contentHeadroom gives the precise value.
-            //   • macOS 14:  no public API — approximate from pixel format.
-            if let cg = cgImage {
-                if #available(macOS 15.0, *) {
-                    let ci = CIImage(cgImage: cg)
-                    let h = Float(ci.contentHeadroom)
-                    if h > 0, h.isFinite { headroom = h }
-                } else {
-                    // macOS 14 fallback: if the HDR decode produced a deeper-than-8-bit
-                    // pixel buffer or an extended-range colorspace, assume HDR content
-                    // with a conservative 2.0× headroom estimate.
-                    let isExtendedRange: Bool = cg.colorSpace
-                        .map { CGColorSpaceUsesExtendedRange($0) } ?? false
-                    if cg.bitsPerComponent > 8 || isExtendedRange {
-                        headroom = 2.0
-                    }
-                }
+            // Read precise headroom on macOS 15+
+            if let cg = cgImage, #available(macOS 15.0, *) {
+                let ci = CIImage(cgImage: cg)
+                let h = Float(ci.contentHeadroom)
+                if h > 0, h.isFinite { headroom = h }
             }
         }
 
-        // Fallback: standard SDR decode (macOS 13 or HDR decode unavailable for this format)
+        // ── Step 3: Standard decode fallback ───────────────────────────────
         if cgImage == nil {
             cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
         }
-
         guard let cgImage else {
             throw ImageViewerError.decodeFailed(url, underlying: nil)
         }
 
-        let image = NSImage(cgImage: cgImage,
-                            size: NSSize(width: cgImage.width, height: cgImage.height))
+        // ── Step 4: Headroom heuristic — fill in when API didn't provide it ─
+        // If a gain map exists we KNOW it's HDR even if `contentHeadroom`
+        // returned 1.0 (macOS 14 has no API). Use a sensible default that
+        // matches typical iPhone gain maps.
+        if headroom <= 1.001 && hasGainMap {
+            // iPhone HDR photos typically have ~2.0–3.0× headroom.
+            // 2.0 is a safe default that produces a clearly visible HDR pop
+            // without over-brightening the image.
+            headroom = 2.0
+        }
 
-        // Extract metadata
+        // Also catch the "deep colour" case (e.g. 16-bit float EXR loaded via ImageIO)
+        if headroom <= 1.001 {
+            let isExtendedRange: Bool = cgImage.colorSpace
+                .map { CGColorSpaceUsesExtendedRange($0) } ?? false
+            if cgImage.bitsPerComponent > 8 || isExtendedRange {
+                headroom = 1.6
+            }
+        }
+
+        // ── Step 5: Build metadata ─────────────────────────────────────────
+        let nsImage = NSImage(cgImage: cgImage,
+                              size: NSSize(width: cgImage.width, height: cgImage.height))
+
         let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] ?? [:]
         let exif  = props[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? [:]
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -177,10 +204,26 @@ final class ImageIODecoder: ImageDecoder {
         meta.fileSize   = (attrs?[.size] as? Int64) ?? 0
         meta.exif       = exif
         meta.headroom   = headroom
-        meta.isHDR      = headroom > 1.001 || cgImage.bitsPerComponent > 8
+        meta.hasGainMap = hasGainMap
+        meta.isHDR      = headroom > 1.001 || hasGainMap || cgImage.bitsPerComponent > 8
         meta.colorSpace = cgImage.colorSpace?.name as String? ?? "Unknown"
 
-        return DecodedImage(image: image, metadata: meta)
+        // ── Step 6: Diagnostic log ─────────────────────────────────────────
+        // Always-on in DEBUG, gated behind a one-line opt-in flag in release.
+        #if DEBUG
+        print("""
+        [ImageViewerKit] \(url.lastPathComponent)
+          format         = \(meta.format)  (\(meta.width)×\(meta.height), \(meta.colorDepth)-bit)
+          colorSpace     = \(meta.colorSpace)
+          hasISOGainMap  = \(hasISOGainMap)
+          hasAppleGainMap= \(hasAppleGainMap)
+          hdrDecodeOK    = \(hdrDecodeSucceeded)
+          headroom       = \(String(format: "%.2f×", meta.headroom))
+          isHDR          = \(meta.isHDR)
+        """)
+        #endif
+
+        return DecodedImage(image: nsImage, metadata: meta)
     }
 }
 
