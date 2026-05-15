@@ -33,6 +33,11 @@ public struct ImageViewerConfiguration {
     public var sdrColorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     /// Tone-mapping curve applied when displaying HDR content on SDR screens.
+    /// ⚠️ Deprecated: As of v1.2.5 the renderer never applies a tone curve.
+    /// SDR mode shows the file's native SDR base; HDR mode shows the
+    /// gain-map-expanded variant. This setting is kept for source-compat
+    /// only and has no effect.
+    @available(*, deprecated, message: "ToneMappingMode is no longer used. SDR mode renders the SDR base directly, HDR mode renders the gain-map-expanded variant.")
     public var toneMappingMode: ToneMappingMode = .auto
 
     // MARK: - UI Layout

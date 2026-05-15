@@ -123,22 +123,38 @@ public final class HDRRenderer: NSView {
     private func applyMetalLayerColorSettings(useHDR: Bool) {
         guard let layer = metalLayer else { return }
         if useHDR {
+            // HDR: extended-range linear sRGB primaries — supports values >1.0
+            // and is the standard EDR pipeline space on Apple platforms.
             layer.wantsExtendedDynamicRangeContent = true
             layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
         } else {
+            // SDR: Display P3 — WIDE-GAMUT SDR. Using plain sRGB here would
+            // clip the iPhone HEIC source's saturated P3 reds/greens, which
+            // reads visually as a tone-mapped (washed-out) image.
             layer.wantsExtendedDynamicRangeContent = false
-            layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            layer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
         }
     }
 
     private func rebuildCIContext(useHDR: Bool) {
         guard let device = metalDevice else { return }
-        let cs = useHDR
-            ? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
-            : CGColorSpace(name: CGColorSpace.sRGB)
+
+        // Working colorspace is ALWAYS extended-linear sRGB.
+        // Linear → CI does compositing math in linear light (correct).
+        // Extended → out-of-sRGB-gamut P3 colors are representable as
+        //            negative values without clipping.
+        // This eliminates the gamma-space math + gamut-clip artefacts
+        // that previously made SDR look "tone-mapped".
+        let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+
+        // Output colorspace matches the destination layer.
+        let outputCS = useHDR
+            ? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)   // HDR: keep extended linear
+            : CGColorSpace(name: CGColorSpace.displayP3)            // SDR: gamma-encoded wide-gamut
+
         let opts: [CIContextOption: Any] = [
-            .workingColorSpace: cs as Any,
-            .outputColorSpace:  cs as Any
+            .workingColorSpace: workingCS as Any,
+            .outputColorSpace:  outputCS as Any
         ]
         self.ciContext = CIContext(mtlDevice: device, options: opts)
     }
