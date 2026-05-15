@@ -47,6 +47,7 @@ public final class HDRRenderer: NSView {
     private var rotation: CGFloat   = 0.0
     private var userPan: CGPoint    = .zero
     private var hasUserAdjustedZoom = false
+    private var didLogThisImage     = false   // diagnostic log throttle
 
     // MARK: - Configuration
 
@@ -123,14 +124,14 @@ public final class HDRRenderer: NSView {
     private func applyMetalLayerColorSettings(useHDR: Bool) {
         guard let layer = metalLayer else { return }
         if useHDR {
-            // HDR: extended-range linear sRGB primaries — supports values >1.0
-            // and is the standard EDR pipeline space on Apple platforms.
+            // HDR: extended-linear Display P3 — wide gamut + HDR (values >1.0)
             layer.wantsExtendedDynamicRangeContent = true
-            layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+            layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+                            ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
         } else {
-            // SDR: Display P3 — WIDE-GAMUT SDR. Using plain sRGB here would
-            // clip the iPhone HEIC source's saturated P3 reds/greens, which
-            // reads visually as a tone-mapped (washed-out) image.
+            // SDR: Display P3 (gamma-encoded). Matches the iPhone HEIC source's
+            // native colorspace exactly — Core Image performs ZERO conversion
+            // when source, working, and output are all the same space.
             layer.wantsExtendedDynamicRangeContent = false
             layer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
         }
@@ -139,22 +140,21 @@ public final class HDRRenderer: NSView {
     private func rebuildCIContext(useHDR: Bool) {
         guard let device = metalDevice else { return }
 
-        // Working colorspace is ALWAYS extended-linear sRGB.
-        // Linear → CI does compositing math in linear light (correct).
-        // Extended → out-of-sRGB-gamut P3 colors are representable as
-        //            negative values without clipping.
-        // This eliminates the gamma-space math + gamut-clip artefacts
-        // that previously made SDR look "tone-mapped".
-        let workingCS = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
-
-        // Output colorspace matches the destination layer.
-        let outputCS = useHDR
-            ? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)   // HDR: keep extended linear
-            : CGColorSpace(name: CGColorSpace.displayP3)            // SDR: gamma-encoded wide-gamut
+        // CRITICAL: working AND output spaces must match the layer exactly.
+        // Any mismatch causes CI to insert a colorspace conversion which
+        // (depending on rendering intent) can compress colors and visually
+        // resemble a tone curve.
+        //
+        // SDR: everything in Display P3 (gamma-encoded).
+        // HDR: everything in extended-linear Display P3 (linear, supports >1.0).
+        let cs: CGColorSpace? = useHDR
+            ? (CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+                ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB))
+            : CGColorSpace(name: CGColorSpace.displayP3)
 
         let opts: [CIContextOption: Any] = [
-            .workingColorSpace: workingCS as Any,
-            .outputColorSpace:  outputCS as Any
+            .workingColorSpace: cs as Any,
+            .outputColorSpace:  cs as Any
         ]
         self.ciContext = CIContext(mtlDevice: device, options: opts)
     }
@@ -175,6 +175,7 @@ public final class HDRRenderer: NSView {
         userPan              = .zero
         rotation             = 0
         hasUserAdjustedZoom  = false
+        didLogThisImage      = false   // log diagnostic once per new image
         DispatchQueue.main.async { [weak self] in self?.render() }
     }
 
@@ -224,6 +225,26 @@ public final class HDRRenderer: NSView {
         else { return }
 
         let useHDR = effectiveHDR()
+
+        // ── Render-time diagnostic (DEBUG only, once per image change) ─────
+        #if DEBUG
+        if !didLogThisImage {
+            let img = currentImage(useHDR: useHDR)
+            let srcCS = img?.colorSpace?.name as String? ?? "?"
+            let layerCS = metalLayer.colorspace?.name as String? ?? "?"
+            print("""
+            [HDRRenderer] render
+              useHDR              = \(useHDR)
+              source colorspace   = \(srcCS)
+              layer colorspace    = \(layerCS)
+              wantsEDR            = \(metalLayer.wantsExtendedDynamicRangeContent)
+              source extent       = \(img?.extent ?? .zero)
+              currentImageHeadroom= \(currentImageHeadroom)
+              compareSplit        = \(compareSplit?.description ?? "nil")
+            """)
+            didLogThisImage = true
+        }
+        #endif
 
         // 1. Compute the shared transform (centred + scaled to fit + user zoom/pan)
         let drawableSize = CGSize(width:  drawable.texture.width,
