@@ -141,7 +141,25 @@ public final class HDRRenderer: NSView {
 
     // MARK: - Display
 
+    /// Display a CIImage directly — preferred path. The CIImage retains its
+    /// extended-range pixel data all the way to the Metal drawable, which
+    /// is essential for HDR rendering (NSImage extraction clips to SDR).
+    public func display(ciImage: CIImage,
+                        headroom: Float = 1.0,
+                        configuration: ImageViewerConfiguration) {
+        currentCIImage         = ciImage
+        currentImageHeadroom   = max(1.0, headroom)
+        userZoom               = 1.0
+        userPan                = .zero
+        rotation               = 0
+        hasUserAdjustedZoom    = false
+        DispatchQueue.main.async { [weak self] in self?.render() }
+    }
+
     /// Display an NSImage with optional HDR headroom info from the decoder.
+    /// ⚠️ This path goes through `NSImage.cgImage(forProposedRect:...)` which
+    /// clips extended-range values to SDR. Prefer `display(ciImage:headroom:)`
+    /// for actual HDR display.
     public func display(image: NSImage,
                         headroom: Float = 1.0,
                         configuration: ImageViewerConfiguration) {

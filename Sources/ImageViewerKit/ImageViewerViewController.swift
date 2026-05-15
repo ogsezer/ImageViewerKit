@@ -234,11 +234,21 @@ public final class ImageViewerViewController: NSViewController {
                 let result = try await decoderPipeline.decode(url: url)
                 await MainActor.run {
                     self.showLoading(false)
-                    self.hdrRenderer.display(
-                        image: result.image,
-                        headroom: result.metadata.headroom,
-                        configuration: self.configuration
-                    )
+                    // Prefer the HDR-preserving CIImage path when the decoder
+                    // produced one. The NSImage extraction clips to SDR.
+                    if let ci = result.ciImage {
+                        self.hdrRenderer.display(
+                            ciImage: ci,
+                            headroom: result.metadata.headroom,
+                            configuration: self.configuration
+                        )
+                    } else {
+                        self.hdrRenderer.display(
+                            image: result.image,
+                            headroom: result.metadata.headroom,
+                            configuration: self.configuration
+                        )
+                    }
                     self.refreshDisplayModeToggle()
                     self.metadataView?.update(with: result.metadata)
                     self.thumbnailStripView?.select(index: index)
